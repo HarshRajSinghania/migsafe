@@ -1,22 +1,32 @@
 # Contributing
 
-## Most useful contributions
+## Adding a rule
 
-1. **A new rule** for a Postgres lock or data-loss shape we miss. Add it to `check_statement`,
-   with a severity, a fix, a firing test, and a suppressing test.
-2. **Migration-runner integration** (Alembic, Flyway, Django, Atlas) so migsafe can be called from
-   the runner rather than CI.
-3. **Dialect notes** for MySQL or SQLite, as documentation first, code second.
+Rules live in `migsafe/rules.py`. Each one needs:
 
-## Rules
+- an `id` (stable, kebab-case)
+- a severity from `SEVERITY_ORDER`
+- a `what` sentence describing the production consequence, not the SQL keyword
+- a `fix` sentence a developer can act on
 
-- No database connection. migsafe reads files and must stay usable in CI with no credentials.
-- Every rule needs both a fire case and an escape hatch case.
-- Severity is about consequence: data loss is critical even if the table is small.
-- Never say a migration is safe. Say which rules fired and which did not apply.
+Add a case to `tests/test_rules.py` with the smallest SQL that triggers it, plus a **negative** test
+proving the nearby safe form is not flagged. A rule that cannot distinguish the safe form is not
+ready.
 
-## Tests
+## Running the tests
 
 ```bash
 python -m pytest -q
 ```
+
+## Rules of the road
+
+- PostgreSQL first. Other dialects are a separate module, not a regex tweak.
+- Never flag a table created in the same file (see `new-table` suppression).
+- Explain the consequence: "blocks writes for the whole build", not "concurrent=false".
+- Critical means "irreversible or takes the table down". Do not inflate severity.
+- No database connection, ever. This is static analysis of the SQL you are about to run.
+
+## Pull requests
+
+One rule per PR, positive and negative test, `pytest` green.

@@ -44,6 +44,15 @@ def main(argv: list[str] | None = None) -> int:
         help="exit 2 when a finding at this severity or worse exists (default: high)",
     )
     parser.add_argument("--version", action="version", version=f"migsafe {__version__}")
+    # `migsafe check path` reads better than a bare path list; accept both.
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "check":
+        argv = argv[1:]
+    if not argv:
+        parser.print_help()
+        return 0
+
     args = parser.parse_args(argv)
 
     report = check_files(collect(args.paths))

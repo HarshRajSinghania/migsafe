@@ -1,111 +1,73 @@
 # migsafe
 
-This migration would have locked your users table for 40 seconds. migsafe tells you before it merges.
+**This migration would have locked your `users` table. migsafe tells you before you merge it.** Static analysis for PostgreSQL migrations: locks, rewrites, destructive steps, missing timeouts.
 
-```bash
-migsafe check migrations/
-```
+[![ci](https://github.com/mgkvibez/migsafe/actions/workflows/ci.yml/badge.svg)](https://github.com/mgkvibez/migsafe/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![postgres](https://img.shields.io/badge/postgresql-12%2B-336791.svg)](https://www.postgresql.org/)
+[![stars](https://img.shields.io/github/stars/mgkvibez/migsafe?style=flat&color=yellow)](https://github.com/mgkvibez/migsafe/stargazers)
 
-```
-migsafe: 4 finding(s), worst critical
-
-[CRITICAL] line 7 (drop-table)
-  what: DROP TABLE destroys data and cannot be undone by rollback after commit
-  fix:  Rename the table instead, drop it in a later release once nothing references it
-
-[CRITICAL] line 8 (unbounded-write)
-  what: UPDATE without WHERE touches every row and locks them
-  fix:  Add a WHERE clause and batch the operation
-
-[HIGH] line 6 (volatile-default)
-  what: Volatile DEFAULT (now()) rewrites the table and takes a long lock
-  fix:  Add the column without a default, backfill in batches, then set the default
-
-[MEDIUM] line 1 (no-timeout)
-  what: Migration sets no statement_timeout or lock_timeout
-  fix:  Prefix the migration with SET lock_timeout = '3s'; SET statement_timeout = '30s'
-```
+![migsafe demo](docs/demo/migsafe.svg)
 
 ## Install
 
 ```bash
-pipx install migsafe
+pipx install git+https://github.com/mgkvibez/migsafe.git
 ```
 
-Python 3.9+, no dependencies, no database connection. It reads SQL files.
-
-## Usage
+## Three ways to use it
 
 ```bash
-migsafe check migrations/                     # a directory of .sql files
-migsafe check 001_init.sql 002_add_users.sql  # specific files
-migsafe check migrations/ --json              # for CI and agents
-migsafe check migrations/ --fail-on critical  # exit 2 only on data loss
+# 1. Check one migration
+migsafe check migrations/2026_10_29_add_user_flags.sql
+
+# 2. Check the whole directory (fails the build on high and above)
+migsafe check migrations/ --fail-on high
+
+# 3. Machine-readable, for a bot or an agent skill
+migsafe check migrations/ --json
 ```
 
-Default exit behaviour: **2 when any finding is high or critical**, 0 otherwise. Wire it into CI
-next to your migration runner.
+Exit code is `2` when a finding at or above `--fail-on` exists, so `migsafe check migrations/ && psql ...` is safe by default.
 
-```yaml
-- name: Migration safety
-  run: migsafe check migrations/
-```
+## Why it exists
 
-## Rules
+`ALTER TABLE users ADD COLUMN last_seen timestamptz DEFAULT now()` is four words of difference from a
+statement that rewrites the whole table under an `ACCESS EXCLUSIVE` lock. It passes review because
+it looks like the fifty migrations before it. Then it runs at 14:00 and takes the site down for
+forty seconds, and everyone learns the same lesson the hard way.
 
-| Rule | Severity | Why it matters |
-|---|---|---|
-| `drop-table` | critical | data is gone after commit; rollback does not restore it |
-| `drop-column` | critical | same, one column at a time |
-| `truncate` | critical | ACCESS EXCLUSIVE lock plus total data loss |
-| `unbounded-write` | critical | `UPDATE`/`DELETE` with no `WHERE` locks and rewrites every row |
-| `index-not-concurrent` | high | a plain `CREATE INDEX` blocks writes for the whole build |
-| `add-not-null-column` | high | fails outright on a non-empty table |
-| `volatile-default` | high | `DEFAULT now()` style defaults rewrite the table |
-| `alter-column-type` | high | type changes rewrite the table under an exclusive lock |
-| `constraint-without-not-valid` | high | `ADD CONSTRAINT` validates every row while holding a lock |
-| `unbatched-backfill` | medium | one giant `UPDATE` holds one giant transaction |
-| `multiple-alter-ops` | medium | combined ALTERs hold locks for the slowest operation |
-| `rename` | medium | renames break code still running during the deploy |
-| `set-not-null` | medium | full scan under an exclusive lock |
-| `no-timeout` | medium | no `lock_timeout`, so a blocked migration waits forever |
-
-## What it understands
-
-- Statements are split on top-level semicolons. Semicolons inside strings, `--` comments, `/* */`
-  blocks, and `$$`-quoted function bodies are ignored.
-- `CREATE INDEX` on a table **created in the same migration** is not flagged, because there are no
-  readers to block.
-- `SET lock_timeout` / `SET statement_timeout` anywhere in the file satisfies `no-timeout`.
-
-## Honest limits
-
-- PostgreSQL only. MySQL and SQLite have different locking rules and are not modelled.
-- It is a static pattern matcher, not a query planner. A migration that passes can still be slow.
-- It cannot see table sizes, so severity is by shape, not by measured impact.
-- "No issues found" is the absence of known dangerous shapes. It is never a guarantee.
+The linter encodes that lesson: what takes a lock, what rewrites rows, what cannot be undone, and
+what to write instead.
 
 ## How it works
 
-1. Read the file, strip comments while preserving line numbers.
-2. Split into statements, respecting quotes and dollar-quoted blocks.
-3. Collect tables created in the migration set.
-4. Apply the rule table above, skipping rules that do not apply (new tables, `CONCURRENTLY`,
-   `NOT VALID`).
-5. Sort by severity then line, render text or JSON, set the exit code.
+Splits the file into statements — dollar-quoted blocks, string literals and comments are handled, so a
+`;` inside a function body does not confuse it — then applies rules:
 
-## Tests
+| Severity | Rule | Why it matters |
+|---|---|---|
+| critical | `drop-table`, `drop-column`, `truncate` | data loss that a rollback does not undo after commit |
+| critical | `unbounded-write` | `UPDATE`/`DELETE` with no `WHERE` touches every row |
+| high | `volatile-default` | `DEFAULT now()` on `ADD COLUMN` rewrites the table |
+| high | `add-not-null-column` | `NOT NULL` with no default fails on non-empty tables |
+| high | `index-not-concurrent` | `CREATE INDEX` blocks writes for the whole build |
+| high | `alter-column-type` | type changes rewrite the table and drop dependent indexes |
+| high | `constraint-without-not-valid` | adding a FK or CHECK validates every row under a lock |
+| medium | `unbatched-backfill`, `multiple-alter-ops`, `rename`, `set-not-null`, `no-timeout` | slower failure modes and lock pile-ups |
+
+It knows what the same file creates: an index on a table you are creating in this migration is not
+flagged, because there is nothing to lock yet.
+
+Every finding carries the statement line and a fix you can paste.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md). Tests:
 
 ```bash
 python -m pytest -q
 ```
-
-Fourteen tests: each rule fires, each escape hatch suppresses it, parser edge cases
-(semicolons in strings and comments, dollar-quoted bodies), and a clean migration.
-
-## Contributing
-
-New rules need a firing fixture and a suppressing one. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
